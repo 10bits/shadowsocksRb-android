@@ -56,6 +56,7 @@ data class Profile(
         var obfs: String = "plain",
         var obfs_param: String = "",
         var method: String = "aes-256-cfb",
+
         var route: String = "all",
         var remoteDns: String = "8.8.8.8:53",
         var proxyApps: Boolean = false,
@@ -66,16 +67,38 @@ data class Profile(
         @TargetApi(28)
         var metered: Boolean = false,
         var individual: String = "",
+        var plugin: String? = null,
+        var udpFallback: Long? = null,
+
+        // managed fields
+        var subscription: SubscriptionStatus = SubscriptionStatus.UserConfigured,
         var tx: Long = 0,
         var rx: Long = 0,
         var elapsed: Long = 0,
         var userOrder: Long = 0,
-        var plugin: String? = null,
-        var udpFallback: Long? = null,
 
         @Ignore // not persisted in db, only used by direct boot
         var dirty: Boolean = false
 ) : Parcelable, Serializable {
+    enum class SubscriptionStatus(val persistedValue: Int) {
+        UserConfigured(0),
+        Active(1),
+        /**
+         * This profile is no longer present in subscriptions.
+         */
+        Obsolete(2),
+        ;
+
+        companion object {
+            @JvmStatic
+            @TypeConverter
+            fun of(value: Int) = values().single { it.persistedValue == value }
+            @JvmStatic
+            @TypeConverter
+            fun toInt(status: SubscriptionStatus) = status.persistedValue
+        }
+    }
+
     companion object {
         private const val TAG = "ShadowParser"
         private const val serialVersionUID = 1L
@@ -188,7 +211,7 @@ data class Profile(
                 findAllSSRUrls(data, feature).plus(findAllSSUrls(data, feature))
 
         private class JsonParser(private val feature: Profile? = null) : ArrayList<Profile>() {
-            private val fallbackMap = mutableMapOf<Profile, Profile>()
+            val fallbackMap = mutableMapOf<Profile, Profile>()
 
             private val JsonElement?.optString get() = (this as? JsonPrimitive)?.asString
             private val JsonElement?.optBoolean
@@ -210,12 +233,10 @@ data class Profile(
                 if (password.isNullOrEmpty()) return null
                 val protocol = json["protocol"].optString
                 if (protocol.isNullOrEmpty()) return null
-                val protocolParam = json["protocol_param"].optString
-                if (protocolParam.isNullOrEmpty()) return null
+                val protocolParam = json["protocol_param"].optString ?: return null
                 val obfs = json["obfs"].optString
                 if (obfs.isNullOrEmpty()) return null
-                val obfsParam = json["obfs_param"].optString
-                if (obfsParam.isNullOrEmpty()) return null
+                val obfsParam = json["obfs_param"].optString ?: return null
                 val method = json["method"].optString
                 if (method.isNullOrEmpty()) return null
                 return Profile().also {
@@ -238,8 +259,8 @@ data class Profile(
                     (json["proxy_apps"] as? JsonObject)?.also {
                         proxyApps = it["enabled"].optBoolean ?: proxyApps
                         bypass = it["bypass"].optBoolean ?: bypass
-                        individual = (json["android_list"] as? JsonArray)?.asIterable()?.joinToString("\n")
-                                ?: individual
+                        individual = (it["android_list"] as? JsonArray)?.asIterable()?.mapNotNull { it.optString }
+                                ?.joinToString("\n") ?: individual
                     }
                     udpdns = json["udpdns"].optBoolean ?: udpdns
                     (json["udp_fallback"] as? JsonObject)?.let { tryParse(it, true) }?.also { fallbackMap[this] = it }
@@ -257,7 +278,7 @@ data class Profile(
                 }
             }
 
-            fun finalize(create: (Profile) -> Unit) {
+            fun finalize(create: (Profile) -> Profile) {
                 val profiles = ProfileManager.getAllProfiles() ?: emptyList()
                 for ((profile, fallback) in fallbackMap) {
                     val match = profiles.firstOrNull {
@@ -267,19 +288,20 @@ data class Profile(
                                 fallback.obfs == it.obfs && fallback.obfs_param == it.obfs_param &&
                                 it.plugin.isNullOrEmpty()
                     }
-                    profile.udpFallback = if (match == null) {
-                        create(fallback)
-                        fallback.id
-                    } else match.id
+                    profile.udpFallback = (match ?: create(fallback)).id
                     ProfileManager.updateProfile(profile)
                 }
             }
         }
 
-        fun parseJson(json: JsonElement, feature: Profile? = null, create: (Profile) -> Unit) {
+        fun parseJson(json: JsonElement, feature: Profile? = null, create: (Profile) -> Profile) {
             JsonParser(feature).run {
                 process(json)
-                for (profile in this) create(profile)
+                for (i in indices) {
+                    val fallback = fallbackMap.remove(this[i])
+                    this[i] = create(this[i])
+                    fallback?.also { fallbackMap[this[i]] = it }
+                }
                 finalize(create)
             }
         }
@@ -290,8 +312,14 @@ data class Profile(
         @Query("SELECT * FROM `Profile` WHERE `id` = :id")
         operator fun get(id: Long): Profile?
 
-        @Query("SELECT * FROM `Profile` ORDER BY `userOrder`")
-        fun list(): List<Profile>
+        @Query("SELECT * FROM `Profile` WHERE `Subscription` != 2 ORDER BY `userOrder`")
+        fun listActive(): List<Profile>
+
+        @Query("SELECT * FROM `Profile` WHERE `Subscription` == 2")
+        fun listObsolete(): List<Profile>
+
+        @Query("SELECT * FROM `Profile`")
+        fun listAll(): List<Profile>
 
         @Query("SELECT * FROM `Profile` WHERE `url_group` = :group")
         fun listByGroup(group: String): List<Profile>
@@ -328,6 +356,8 @@ data class Profile(
         profile.individual = individual
         profile.udpdns = udpdns
         if (withMore) {
+            profile.name = "$name - copy"
+            profile.host = host
             profile.remotePort = remotePort
             profile.password = password
             profile.protocol = protocol
@@ -354,7 +384,6 @@ data class Profile(
                         Base64.encodeToString("%s".format(Locale.ENGLISH, name).toByteArray(), flags),
                         Base64.encodeToString("%s".format(Locale.ENGLISH, url_group).toByteArray(), flags)).toByteArray(), flags)
     }
-
 
     fun toJson(profiles: LongSparseArray<Profile>? = null): JSONObject = JSONObject().apply {
         put("server", host)

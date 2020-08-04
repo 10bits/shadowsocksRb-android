@@ -21,26 +21,31 @@
 package com.github.shadowsocks.utils
 
 import android.annotation.SuppressLint
-import android.content.BroadcastReceiver
-import android.content.ContentResolver
-import android.content.Context
-import android.content.Intent
+import android.content.*
 import android.content.pm.PackageInfo
 import android.content.res.Resources
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.ImageDecoder
+import android.graphics.drawable.AdaptiveIconDrawable
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.LayerDrawable
 import android.net.Uri
 import android.os.Build
+import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
 import android.util.TypedValue
 import androidx.annotation.AttrRes
+import androidx.appcompat.content.res.AppCompatResources
 import androidx.preference.Preference
 import com.crashlytics.android.Crashlytics
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import java.io.FileDescriptor
 import java.net.HttpURLConnection
 import java.net.InetAddress
 import kotlin.coroutines.resume
@@ -61,6 +66,16 @@ fun <T> Iterable<T>.forEachTry(action: (T) -> Unit) {
 
 val Throwable.readableMessage get() = localizedMessage ?: javaClass.name
 
+/**
+ * https://android.googlesource.com/platform/prebuilts/runtime/+/94fec32/appcompat/hiddenapi-light-greylist.txt#9466
+ */
+private val getInt = FileDescriptor::class.java.getDeclaredMethod("getInt$")
+val FileDescriptor.int get() = getInt.invoke(this) as Int
+
+fun FileDescriptor.closeQuietly() = try {
+    Os.close(this)
+} catch (_: ErrnoException) { }
+
 private val parseNumericAddress by lazy @SuppressLint("DiscouragedPrivateApi") {
     InetAddress::class.java.getDeclaredMethod("parseNumericAddress", String::class.java).apply {
         isAccessible = true
@@ -75,9 +90,6 @@ fun String?.parseNumericAddress(): InetAddress? = Os.inet_pton(OsConstants.AF_IN
         ?: Os.inet_pton(OsConstants.AF_INET6, this)?.let {
             if (Build.VERSION.SDK_INT >= 29) it else parseNumericAddress.invoke(null, this) as InetAddress
         }
-
-fun <K, V> MutableMap<K, V>.computeIfAbsentCompat(key: K, value: () -> V) = if (Build.VERSION.SDK_INT >= 24)
-    computeIfAbsent(key) { value() } else this[key] ?: value().also { put(key, it) }
 
 suspend fun <T> HttpURLConnection.useCancellable(block: suspend HttpURLConnection.() -> T): T {
     return suspendCancellableCoroutine { cont ->
@@ -103,6 +115,19 @@ fun broadcastReceiver(callback: (Context, Intent) -> Unit): BroadcastReceiver = 
     override fun onReceive(context: Context, intent: Intent) = callback(context, intent)
 }
 
+fun Context.listenForPackageChanges(onetime: Boolean = true, callback: () -> Unit) = object : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        callback()
+        if (onetime) context.unregisterReceiver(this)
+    }
+}.apply {
+    registerReceiver(this, IntentFilter().apply {
+        addAction(Intent.ACTION_PACKAGE_ADDED)
+        addAction(Intent.ACTION_PACKAGE_FULLY_REMOVED)
+        addDataScheme("package")
+    })
+}
+
 fun ContentResolver.openBitmap(uri: Uri) =
         if (Build.VERSION.SDK_INT >= 28) ImageDecoder.decodeBitmap(ImageDecoder.createSource(this, uri))
         else BitmapFactory.decodeStream(openInputStream(uri))
@@ -126,3 +151,19 @@ fun printLog(t: Throwable) {
 }
 
 fun Preference.remove() = parent!!.removePreference(this)
+
+fun Context.getBitmap(id: Int): Bitmap {
+    var drawable = AppCompatResources.getDrawable(this, id)!!
+    if (drawable is BitmapDrawable) return drawable.bitmap
+    if (Build.VERSION.SDK_INT >= 26 && drawable is AdaptiveIconDrawable) {
+        drawable = LayerDrawable(arrayOf(drawable.background, drawable.foreground))
+    }
+    val bitmap = Bitmap.createBitmap(
+            drawable.intrinsicWidth, drawable.intrinsicHeight,
+            Bitmap.Config.ARGB_8888
+    )
+    val canvas = Canvas(bitmap)
+    drawable.setBounds(0, 0, canvas.width, canvas.height)
+    drawable.draw(canvas)
+    return bitmap
+}
